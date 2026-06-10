@@ -103,6 +103,7 @@ add_iceberg_test(table_test
 
 add_iceberg_test(logging_test
                  SOURCES
+                 cerr_logger_test.cc
                  log_level_test.cc
                  logger_test.cc)
 

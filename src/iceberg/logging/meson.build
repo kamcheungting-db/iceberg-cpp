@@ -30,6 +30,7 @@ configure_file(
 # SpdLogger header are intentionally NOT installed.
 install_headers(
     [
+        'cerr_logger.h',
         'log_level.h',
         'logger.h',
     ],
