@@ -53,6 +53,7 @@ option(ICEBERG_SQL_SQLITE "Build the SQLite connector for the SQL catalog" OFF)
 option(ICEBERG_SQL_POSTGRESQL "Build the PostgreSQL connector for the SQL catalog" OFF)
 option(ICEBERG_SQL_MYSQL "Build the MySQL connector for the SQL catalog" OFF)
 option(ICEBERG_S3 "Build with S3 support" OFF)
+option(ICEBERG_SPDLOG "Use spdlog as the default logging backend" ON)
 option(ICEBERG_ENABLE_ASAN "Enable Address Sanitizer" OFF)
 option(ICEBERG_ENABLE_UBSAN "Enable Undefined Behavior Sanitizer" OFF)
 
