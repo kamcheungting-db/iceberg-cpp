@@ -25,6 +25,7 @@
 
 #include <arrow/array.h>
 #include <arrow/array/builder_binary.h>
+#include <arrow/array/builder_primitive.h>
 #include <arrow/c/bridge.h>
 #include <arrow/extension/uuid.h>
 #include <arrow/filesystem/filesystem.h>
@@ -36,6 +37,8 @@
 #include <arrow/util/key_value_metadata.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_page.h>
+#include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
 
@@ -50,6 +53,7 @@
 #include "iceberg/schema.h"
 #include "iceberg/schema_field.h"
 #include "iceberg/schema_internal.h"
+#include "iceberg/table_properties.h"
 #include "iceberg/test/matchers.h"
 #include "iceberg/test/std_io.h"
 #include "iceberg/test/temp_file_test_base.h"
@@ -1071,7 +1075,155 @@ TEST_F(ParquetReaderTest, ReadNestedUnknownProjection) {
 class ParquetReadWrite : public ::testing::Test {
  protected:
   static void SetUpTestSuite() { parquet::RegisterAll(); }
+
+  void WriteAndReadDataPageEncodings(const std::shared_ptr<::arrow::Array>& data,
+                                     const std::shared_ptr<Schema>& schema,
+                                     const WriterProperties& properties,
+                                     std::vector<::parquet::Encoding::type>& encodings) {
+    std::shared_ptr<FileIO> file_io = arrow::ArrowFileSystemFileIO::MakeMockFileIO();
+    const std::string path = "page_sizes.parquet";
+    ASSERT_THAT(
+        WriteArray(
+            data,
+            {.path = path, .schema = schema, .io = file_io, .properties = properties}),
+        IsOk());
+
+    auto& arrow_file_io = internal::checked_cast<arrow::ArrowFileSystemFileIO&>(*file_io);
+    auto input_file = arrow_file_io.fs()->OpenInputFile(path).ValueOrDie();
+    auto parquet_reader = ::parquet::ParquetFileReader::Open(input_file);
+    ASSERT_EQ(parquet_reader->metadata()->num_row_groups(), 1);
+    auto page_reader = parquet_reader->RowGroup(0)->GetColumnPageReader(0);
+    encodings.clear();
+    while (auto page = page_reader->NextPage()) {
+      if (page->type() == ::parquet::PageType::DATA_PAGE ||
+          page->type() == ::parquet::PageType::DATA_PAGE_V2) {
+        encodings.push_back(
+            internal::checked_cast<const ::parquet::DataPage&>(*page).encoding());
+      }
+    }
+    ASSERT_FALSE(encodings.empty());
+
+    ReaderProperties reader_properties;
+    reader_properties.Set(ReaderProperties::kBatchSize, data->length());
+    std::shared_ptr<::arrow::Array> out;
+    ASSERT_THAT(ReadArray(out,
+                          {.path = path,
+                           .io = file_io,
+                           .projection = schema,
+                           .properties = std::move(reader_properties)},
+                          /*metadata=*/nullptr),
+                IsOk());
+    ASSERT_NE(out, nullptr);
+    ASSERT_TRUE(out->Equals(*data));
+  }
 };
+
+TEST_F(ParquetReadWrite, PageSizeDefaults) {
+  WriterProperties properties;
+  EXPECT_EQ(properties.Get(WriterProperties::kParquetPageSizeBytes), 1024 * 1024);
+  EXPECT_EQ(properties.Get(WriterProperties::kParquetDictSizeBytes), 2 * 1024 * 1024);
+  EXPECT_EQ(WriterProperties::kParquetPageSizeBytes.key(),
+            TableProperties::kParquetPageSizeBytes.key());
+  EXPECT_EQ(WriterProperties::kParquetPageSizeBytes.value(),
+            TableProperties::kParquetPageSizeBytes.value());
+  EXPECT_EQ(WriterProperties::kParquetDictSizeBytes.key(),
+            TableProperties::kParquetDictSizeBytes.key());
+  EXPECT_EQ(WriterProperties::kParquetDictSizeBytes.value(),
+            TableProperties::kParquetDictSizeBytes.value());
+}
+
+TEST_F(ParquetReadWrite, HonorsDataPageSize) {
+  // Boolean columns do not use dictionaries. Keep the row count below Arrow's page
+  // row limit so that byte sizing controls the number of pages.
+  ::arrow::BooleanBuilder builder;
+  for (int i = 0; i < 16 * 1024; ++i) {
+    ASSERT_TRUE(builder.Append(i % 2 == 0).ok());
+  }
+  auto values = builder.Finish().ValueOrDie();
+  auto data = ::arrow::StructArray::Make({values},
+                                         {::arrow::field("value", values->type(), false)})
+                  .ValueOrDie();
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "value", boolean())});
+
+  for (const auto& page_size : {std::string(), std::string("128"), std::string("4096")}) {
+    SCOPED_TRACE("page size: " + page_size);
+    auto properties =
+        WriterProperties::FromMap({{"write.parquet.compression-codec", "uncompressed"}});
+    if (!page_size.empty()) {
+      properties.mutable_configs()["write.parquet.page-size-bytes"] = page_size;
+    }
+    std::vector<::parquet::Encoding::type> encodings;
+    ASSERT_NO_FATAL_FAILURE(
+        WriteAndReadDataPageEncodings(data, schema, properties, encodings));
+    if (page_size == "128") {
+      EXPECT_GT(encodings.size(), 1);
+    } else {
+      EXPECT_EQ(encodings.size(), 1);
+    }
+  }
+}
+
+TEST_F(ParquetReadWrite, HonorsDictionaryPageSize) {
+  // The dictionary is larger than Arrow's 1 MiB default, but smaller than Iceberg's
+  // 2 MiB default. A smaller configured limit must trigger plain-encoding fallback.
+  ::arrow::StringBuilder builder;
+  for (int i = 0; i < 4096; ++i) {
+    ASSERT_TRUE(builder.Append(std::to_string(i) + std::string(400, 'x')).ok());
+  }
+  auto values = builder.Finish().ValueOrDie();
+  auto data = ::arrow::StructArray::Make({values},
+                                         {::arrow::field("value", values->type(), false)})
+                  .ValueOrDie();
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "value", string())});
+
+  for (const auto& dict_size :
+       {std::string(), std::string("262144"), std::string("4194304")}) {
+    SCOPED_TRACE("dictionary size: " + dict_size);
+    auto properties =
+        WriterProperties::FromMap({{"write.parquet.compression-codec", "uncompressed"}});
+    if (!dict_size.empty()) {
+      properties.mutable_configs()["write.parquet.dict-size-bytes"] = dict_size;
+    }
+    std::vector<::parquet::Encoding::type> encodings;
+    ASSERT_NO_FATAL_FAILURE(
+        WriteAndReadDataPageEncodings(data, schema, properties, encodings));
+    if (dict_size == "262144") {
+      EXPECT_THAT(encodings, ::testing::Contains(::parquet::Encoding::PLAIN));
+    } else {
+      EXPECT_THAT(encodings,
+                  ::testing::Each(::testing::AnyOf(::parquet::Encoding::PLAIN_DICTIONARY,
+                                                   ::parquet::Encoding::RLE_DICTIONARY)));
+    }
+  }
+}
+
+TEST_F(ParquetReadWrite, RejectsInvalidPageSizesBeforeCreatingFile) {
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int32())});
+  for (const auto* key :
+       {"write.parquet.page-size-bytes", "write.parquet.dict-size-bytes"}) {
+    for (const auto* value : {"0", "-1", "", "invalid", "1024bytes", "2147483648"}) {
+      SCOPED_TRACE(std::string(key) + "=" + value);
+      std::shared_ptr<FileIO> file_io = arrow::ArrowFileSystemFileIO::MakeMockFileIO();
+      const std::string path = "invalid_page_size.parquet";
+      auto writer = WriterFactoryRegistry::Open(
+          FileFormatType::kParquet,
+          {.path = path,
+           .schema = schema,
+           .io = file_io,
+           .properties = WriterProperties::FromMap({{key, value}})});
+      EXPECT_THAT(writer, IsError(ErrorKind::kInvalidArgument));
+      EXPECT_THAT(writer, HasErrorMessage(key));
+
+      auto& arrow_file_io =
+          internal::checked_cast<arrow::ArrowFileSystemFileIO&>(*file_io);
+      EXPECT_EQ(arrow_file_io.fs()->GetFileInfo(path).ValueOrDie().type(),
+                ::arrow::fs::FileType::NotFound);
+    }
+  }
+}
 
 TEST_F(ParquetReadWrite, EmptyStruct) {
   auto schema =

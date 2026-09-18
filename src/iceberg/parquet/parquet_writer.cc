@@ -233,6 +233,22 @@ Result<std::optional<int32_t>> ParseCodecLevel(const WriterProperties& propertie
   return level;
 }
 
+Result<int32_t> ParsePageSize(const WriterProperties& properties,
+                              const WriterProperties::Entry<int32_t>& entry) {
+  auto size = entry.value();
+  if (auto it = properties.configs().find(entry.key());
+      it != properties.configs().end()) {
+    auto parsed = StringUtils::ParseNumber<int32_t>(it->second);
+    if (!parsed.has_value()) {
+      return InvalidArgument("Invalid value for {}: {}", entry.key(),
+                             parsed.error().message);
+    }
+    size = parsed.value();
+  }
+  ICEBERG_PRECHECK(size > 0, "{} must be greater than 0", entry.key());
+  return size;
+}
+
 }  // namespace
 
 class ParquetWriter::Impl {
@@ -242,9 +258,17 @@ class ParquetWriter::Impl {
 
     ICEBERG_ASSIGN_OR_RAISE(auto compression, ParseCompression(options.properties));
     ICEBERG_ASSIGN_OR_RAISE(auto compression_level, ParseCodecLevel(options.properties));
+    ICEBERG_ASSIGN_OR_RAISE(
+        auto page_size,
+        ParsePageSize(options.properties, WriterProperties::kParquetPageSizeBytes));
+    ICEBERG_ASSIGN_OR_RAISE(
+        auto dict_size,
+        ParsePageSize(options.properties, WriterProperties::kParquetDictSizeBytes));
 
     auto properties_builder = ::parquet::WriterProperties::Builder();
     properties_builder.compression(compression);
+    properties_builder.data_pagesize(page_size);
+    properties_builder.dictionary_pagesize_limit(dict_size);
     auto max_row_group_rows =
         options.properties.Get(WriterProperties::kParquetMaxRowGroupRows);
     ICEBERG_PRECHECK(max_row_group_rows > 0,

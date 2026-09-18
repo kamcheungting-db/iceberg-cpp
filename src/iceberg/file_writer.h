@@ -63,6 +63,13 @@ class ICEBERG_EXPORT WriterProperties : public ConfigBase<WriterProperties> {
   /// \brief Maximum number of rows in each Parquet row group.
   inline static Entry<int64_t> kParquetMaxRowGroupRows{"write.parquet.max-row-group-rows",
                                                        1024 * 1024};
+  /// \brief Target size of Parquet data pages in bytes.
+  inline static Entry<int32_t> kParquetPageSizeBytes{"write.parquet.page-size-bytes",
+                                                     1024 * 1024};
+  /// \brief Maximum Parquet dictionary page size in bytes before falling back to plain
+  /// encoding.
+  inline static Entry<int32_t> kParquetDictSizeBytes{"write.parquet.dict-size-bytes",
+                                                     2 * 1024 * 1024};
 
   /// TODO(gangwu): add table properties with write.avro|parquet|orc.*
 
