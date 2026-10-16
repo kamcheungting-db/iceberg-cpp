@@ -25,13 +25,15 @@
 #include <utility>
 #include <vector>
 
+#include <nanoarrow/nanoarrow.h>
+
 #include "iceberg/arrow_c_data_guard_internal.h"
 #include "iceberg/arrow_c_data_util_internal.h"
 #include "iceberg/data/delete_filter.h"
 #include "iceberg/file_reader.h"
 #include "iceberg/manifest/manifest_entry.h"
+#include "iceberg/nanoarrow_status_internal.h"
 #include "iceberg/schema.h"
-#include "iceberg/schema_internal.h"
 #include "iceberg/table_scan.h"
 #include "iceberg/util/macros.h"
 
@@ -78,12 +80,6 @@ class MergeOnReadStreamSource {
         project_all_rows_(required_schema_->SameSchema(*projected_schema_)),
         projection_context_(std::move(projection_context)) {}
 
-  ~MergeOnReadStreamSource() {
-    if (cached_schema_.has_value() && cached_schema_->release != nullptr) {
-      cached_schema_->release(&cached_schema_.value());
-    }
-  }
-
   Status Close() {
     if (reader_ == nullptr) {
       return {};
@@ -92,12 +88,6 @@ class MergeOnReadStreamSource {
   }
 
   Result<std::optional<ArrowArray>> Next() {
-    if (!cached_schema_.has_value()) {
-      // File readers expose one stable Arrow schema for every batch in the stream.
-      ICEBERG_ASSIGN_OR_RAISE(cached_schema_, reader_->Schema());
-    }
-    ArrowSchema& input_arrow_schema = cached_schema_.value();
-
     while (true) {
       ICEBERG_ASSIGN_OR_RAISE(auto next_batch, reader_->Next());
       if (!next_batch.has_value()) {
@@ -107,8 +97,9 @@ class MergeOnReadStreamSource {
       ArrowArray input_batch = std::move(next_batch.value());
       internal::ArrowArrayGuard input_batch_guard(&input_batch);
 
-      ICEBERG_ASSIGN_OR_RAISE(
-          auto alive, delete_filter_->ComputeAliveRows(input_arrow_schema, input_batch));
+      ICEBERG_ASSIGN_OR_RAISE(auto alive,
+                              delete_filter_->ComputeAliveRows(
+                                  projection_context_.input_arrow_schema(), input_batch));
       if (alive.empty()) {
         continue;
       }
@@ -125,8 +116,9 @@ class MergeOnReadStreamSource {
   }
 
   Result<ArrowSchema> Schema() {
-    ArrowSchema schema;
-    ICEBERG_RETURN_UNEXPECTED(ToArrowSchema(*projected_schema_, &schema));
+    ArrowSchema schema{};
+    ICEBERG_NANOARROW_RETURN_UNEXPECTED(
+        ArrowSchemaDeepCopy(&projection_context_.output_arrow_schema(), &schema));
     return schema;
   }
 
@@ -137,7 +129,6 @@ class MergeOnReadStreamSource {
   std::shared_ptr<::iceberg::Schema> projected_schema_;
   bool project_all_rows_ = false;
   ProjectionContext projection_context_;
-  std::optional<ArrowSchema> cached_schema_;
 };
 
 }  // namespace
@@ -209,17 +200,21 @@ class FileScanTaskReader::Impl {
                            io_, field_lookup_, has_position_deletes, delete_counter_));
 
     auto required_schema = delete_filter->RequiredSchema();
-    auto project_batch_function = ProjectionContext::ResolveProjectBatchFunction();
-    // ProjectionContext borrows schemas that are kept in MergeOnReadStreamSource.
-    ICEBERG_ASSIGN_OR_RAISE(auto projection_context,
-                            ProjectionContext::Make(*required_schema, *projected_schema_,
-                                                    project_batch_function));
-
     auto options = MakeReaderOptions(task, io_, required_schema, task.residual_filter(),
                                      name_mapping_, properties_, data_file->first_row_id,
                                      data_file->data_sequence_number);
     ICEBERG_ASSIGN_OR_RAISE(auto reader,
                             ReaderFactoryRegistry::Open(data_file->file_format, options));
+
+    // Resolve the physical layout before emitting any batch. Both pass-through and
+    // projected batches must use the same types, including nested list offset widths.
+    ICEBERG_ASSIGN_OR_RAISE(auto input_arrow_schema, reader->Schema());
+    internal::ArrowSchemaGuard input_schema_guard(&input_arrow_schema);
+    // ProjectionContext owns Arrow schemas and borrows the Iceberg schemas kept below.
+    ICEBERG_ASSIGN_OR_RAISE(
+        auto projection_context,
+        ProjectionContext::Make(*required_schema, *projected_schema_, input_arrow_schema,
+                                ProjectionContext::ResolveProjectBatchFunction()));
 
     auto mor_reader = std::make_unique<MergeOnReadStreamSource>(
         std::move(reader), std::move(delete_filter), std::move(required_schema),

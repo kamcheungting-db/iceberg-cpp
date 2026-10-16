@@ -76,6 +76,18 @@ class ICEBERG_EXPORT ProjectionContext {
                                         const Schema& output_schema,
                                         ProjectBatchFunction project_batch_function);
 
+  /// \brief Build projection state using the format reader's physical Arrow layout.
+  ///
+  /// The physical input fields must correspond to input_schema in the same order.
+  /// The output preserves each selected field's physical layout, including nested
+  /// list offset widths and type-specific flags, with the top-level names and
+  /// nullability from output_schema. The Arrow schemas are copied and owned by the
+  /// context; the Iceberg schemas remain borrowed.
+  static Result<ProjectionContext> Make(const Schema& input_schema,
+                                        const Schema& output_schema,
+                                        const ArrowSchema& physical_input_schema,
+                                        ProjectBatchFunction project_batch_function);
+
   ProjectionContext(ProjectionContext&&) noexcept;
   ProjectionContext& operator=(ProjectionContext&&) noexcept;
   ~ProjectionContext();
@@ -237,7 +249,7 @@ ICEBERG_EXPORT Result<ArrowArrayStream> MakeArrowArrayStream(
 /// \param row_indices Zero-based row positions to copy from `input_batch`.
 /// \param projection Reusable schema/projection state created by
 ///   ProjectionContext::Make.
-/// \return A newly owned ArrowArray matching `projection.output_schema()`.
+/// \return A newly owned ArrowArray matching `projection.output_arrow_schema()`.
 ICEBERG_EXPORT Result<ArrowArray> ProjectBatch(ArrowArray* input_batch,
                                                std::span<const int32_t> row_indices,
                                                ProjectionContext& projection);

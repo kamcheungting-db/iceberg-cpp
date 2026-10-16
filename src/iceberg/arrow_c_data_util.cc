@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -280,6 +281,46 @@ Result<ProjectionContext> ProjectionContext::Make(
   ICEBERG_RETURN_UNEXPECTED(ToArrowSchema(output_schema, &context.output_arrow_schema_));
   context.project_batch_function_ = project_batch_function;
 
+  return context;
+}
+
+Result<ProjectionContext> ProjectionContext::Make(
+    const Schema& input_schema, const Schema& output_schema,
+    const ArrowSchema& physical_input_schema,
+    ProjectionContext::ProjectBatchFunction project_batch_function) {
+  ArrowSchemaView schema_view;
+  ArrowError error;
+  ICEBERG_NANOARROW_RETURN_UNEXPECTED_WITH_ERROR(
+      ArrowSchemaViewInit(&schema_view, &physical_input_schema, &error), error);
+  ICEBERG_PRECHECK(
+      schema_view.type == NANOARROW_TYPE_STRUCT &&
+          std::cmp_equal(physical_input_schema.n_children, input_schema.fields().size()),
+      "Physical input schema must be a struct with {} fields",
+      input_schema.fields().size());
+
+  ICEBERG_ASSIGN_OR_RAISE(
+      auto selected_field_indices,
+      BuildSelectedFieldIndices(input_schema.fields(), output_schema.fields()));
+  ProjectionContext context;
+  context.input_schema_ = &input_schema;
+  context.output_schema_ = &output_schema;
+  context.selected_field_indices_ = std::move(selected_field_indices);
+  context.project_batch_function_ = project_batch_function;
+  ICEBERG_NANOARROW_RETURN_UNEXPECTED(
+      ArrowSchemaDeepCopy(&physical_input_schema, &context.input_arrow_schema_));
+  ICEBERG_RETURN_UNEXPECTED(ToArrowSchema(output_schema, &context.output_arrow_schema_));
+  for (size_t i = 0; i < context.selected_field_indices_.size(); ++i) {
+    auto* output_field = context.output_arrow_schema_.children[i];
+    const auto nullable_flag = output_field->flags & ARROW_FLAG_NULLABLE;
+    output_field->release(output_field);
+    ICEBERG_NANOARROW_RETURN_UNEXPECTED(ArrowSchemaDeepCopy(
+        physical_input_schema.children[context.selected_field_indices_[i]],
+        output_field));
+    ICEBERG_NANOARROW_RETURN_UNEXPECTED(ArrowSchemaSetName(
+        output_field, std::string(output_schema.fields()[i].name()).c_str()));
+    // Keep type-specific flags such as sorted map keys when applying nullability.
+    output_field->flags = (output_field->flags & ~ARROW_FLAG_NULLABLE) | nullable_flag;
+  }
   return context;
 }
 

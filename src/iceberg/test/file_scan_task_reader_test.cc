@@ -33,6 +33,7 @@
 #include <arrow/json/from_string.h>
 #include <arrow/record_batch.h>
 #include <arrow/table.h>
+#include <nanoarrow/nanoarrow.hpp>
 #include <parquet/arrow/writer.h>
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
@@ -792,6 +793,199 @@ TEST_F(FileScanTaskReaderTest, OpenWithEqualityDeletesKeepsInputBatchWhenAllRows
   ASSERT_NO_FATAL_FAILURE(
       VerifyStream(&stream, R"([[1, "Foo"], [2, "Bar"], [3, "Baz"]])"));
 }
+
+enum class PhysicalListLayout { kList, kLargeList, kStoredMixed };
+enum class DeleteBatchSelection { kFirstRow, kSecondBatchRow, kNoOp, kFirstBatch, kAll };
+
+class FileScanTaskPhysicalSchemaTest
+    : public FileScanTaskReaderTest,
+      public ::testing::WithParamInterface<
+          std::tuple<DeleteBatchSelection, bool, PhysicalListLayout>> {
+ public:
+  static std::string ParamName(const ::testing::TestParamInfo<ParamType>& info) {
+    const auto& [deletes, prune, layout] = info.param;
+    constexpr std::array names{"DeleteFirst", "DeleteSecond", "NoOp", "DeleteFirstBatch",
+                               "DeleteAll"};
+    std::string name = names[static_cast<size_t>(deletes)];
+    name += prune ? "Pruned" : "AllColumns";
+    name +=
+        layout == PhysicalListLayout::kList
+            ? "List"
+            : (layout == PhysicalListLayout::kLargeList ? "LargeList" : "StoredMixed");
+    return name;
+  }
+
+ protected:
+  Result<std::shared_ptr<DataFile>> MakeDataFileWithStoredSchema(
+      const std::shared_ptr<::arrow::Schema>& schema, const std::string& json) {
+    ICEBERG_ASSIGN_OR_RAISE(auto batch, MakeRecordBatch(schema, json));
+    ICEBERG_ARROW_ASSIGN_OR_RETURN(auto table,
+                                   ::arrow::Table::FromRecordBatches(schema, {batch}));
+    auto path = CreateNewTempFilePathWithSuffix(".parquet");
+    ICEBERG_ASSIGN_OR_RAISE(auto output, arrow::OpenArrowOutputStream(file_io_, path));
+    auto writer_properties =
+        ::parquet::ArrowWriterProperties::Builder().store_schema()->build();
+    ICEBERG_ARROW_RETURN_NOT_OK(::parquet::arrow::WriteTable(
+        *table, ::arrow::default_memory_pool(), output, table->num_rows(),
+        ::parquet::default_writer_properties(), writer_properties));
+    ICEBERG_ARROW_RETURN_NOT_OK(output->Close());
+    ICEBERG_ASSIGN_OR_RAISE(auto input, file_io_->NewInputFile(path));
+    ICEBERG_ASSIGN_OR_RAISE(auto size, input->Size());
+    return std::make_shared<DataFile>(DataFile{.content = DataFile::Content::kData,
+                                               .file_path = path,
+                                               .file_format = FileFormatType::kParquet,
+                                               .record_count = table->num_rows(),
+                                               .file_size_in_bytes = size});
+  }
+};
+
+TEST_P(FileScanTaskPhysicalSchemaTest, StablePhysicalSchemaAcrossDeleteBatches) {
+  const auto [deletes, prune_columns, layout] = GetParam();
+  const bool use_large_list = layout == PhysicalListLayout::kLargeList;
+  table_schema_ = std::make_shared<Schema>(std::vector<SchemaField>{
+      SchemaField::MakeRequired(1, "id", int32()),
+      SchemaField::MakeOptional(
+          2, "numbers",
+          std::make_shared<ListType>(SchemaField::MakeOptional(3, "element", int32()))),
+      SchemaField::MakeOptional(
+          4, "nested",
+          std::make_shared<StructType>(std::vector<SchemaField>{SchemaField::MakeOptional(
+              5, "tags",
+              std::make_shared<ListType>(
+                  SchemaField::MakeOptional(6, "element", int32())))}))});
+  projected_schema_ = prune_columns
+                          ? std::make_shared<Schema>(std::vector<SchemaField>{
+                                table_schema_->fields()[2], table_schema_->fields()[1]})
+                          : table_schema_;
+  ICEBERG_UNWRAP_OR_FAIL(auto expected_schema, MakeArrowSchema(*table_schema_));
+  if (layout != PhysicalListLayout::kList) {
+    auto fields = expected_schema->fields();
+    fields[1] = fields[1]->WithType(::arrow::large_list(fields[1]->type()->field(0)));
+    if (use_large_list) {
+      auto tags = fields[2]->type()->field(0);
+      fields[2] = fields[2]->WithType(::arrow::struct_(
+          {tags->WithType(::arrow::large_list(tags->type()->field(0)))}));
+    }
+    expected_schema = ::arrow::schema(std::move(fields));
+  }
+  const std::string json =
+      R"([[1, [10, 11], {"tags": [1, null]}], [2, null, {"tags": []}],
+          [3, [], null], [4, [40], {"tags": null}]])";
+  std::string delete_json;
+  std::vector<std::string> expected_json{
+      R"([[1, [10, 11], {"tags": [1, null]}], [2, null, {"tags": []}]])",
+      R"([[3, [], null], [4, [40], {"tags": null}]])"};
+  switch (deletes) {
+    case DeleteBatchSelection::kFirstRow:
+      delete_json = "[[1]]";
+      expected_json[0] = R"([[2, null, {"tags": []}]])";
+      break;
+    case DeleteBatchSelection::kSecondBatchRow:
+      delete_json = "[[3]]";
+      expected_json[1] = R"([[4, [40], {"tags": null}]])";
+      break;
+    case DeleteBatchSelection::kNoOp:
+      delete_json = "[[99]]";
+      break;
+    case DeleteBatchSelection::kFirstBatch:
+      delete_json = "[[1], [2]]";
+      expected_json.erase(expected_json.begin());
+      break;
+    case DeleteBatchSelection::kAll:
+      delete_json = "[[1], [2], [3], [4]]";
+      expected_json.clear();
+      break;
+  }
+  ICEBERG_UNWRAP_OR_FAIL(auto data_file,
+                         layout == PhysicalListLayout::kStoredMixed
+                             ? MakeDataFileWithStoredSchema(expected_schema, json)
+                             : MakeDataFile(table_schema_, json, /*record_count=*/4));
+  auto delete_schema =
+      std::make_shared<Schema>(std::vector<SchemaField>{table_schema_->fields()[0]});
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto eq_delete, MakeEqualityDeleteFile(CreateNewTempFilePathWithSuffix(".parquet"),
+                                             delete_schema, delete_json, {1}));
+  FileScanTask task(data_file, {eq_delete});
+
+  ReaderProperties properties;
+  properties.Set(ReaderProperties::kBatchSize, int64_t{2});
+  properties.Set(ReaderProperties::kArrowUseLargeList, use_large_list);
+  FileScanTaskReader::Options options{.io = file_io_,
+                                      .table_schema = table_schema_,
+                                      .projected_schema = projected_schema_,
+                                      .properties = properties.configs()};
+  ICEBERG_UNWRAP_OR_FAIL(auto reader, FileScanTaskReader::Make(std::move(options)));
+  ICEBERG_UNWRAP_OR_FAIL(auto opened_stream, reader->Open(task));
+  nanoarrow::UniqueArrayStream stream(&opened_stream);
+  nanoarrow::UniqueSchema retained_schema;
+  ASSERT_EQ(stream->get_schema(stream.get(), retained_schema.get()), 0)
+      << stream->get_last_error(stream.get());
+  auto output_schema =
+      prune_columns
+          ? ::arrow::schema({expected_schema->field(2), expected_schema->field(1)})
+          : expected_schema;
+  auto verify_schema = [&]() {
+    nanoarrow::UniqueSchema declared_schema;
+    ASSERT_EQ(stream->get_schema(stream.get(), declared_schema.get()), 0)
+        << stream->get_last_error(stream.get());
+    auto import_result = ::arrow::ImportSchema(declared_schema.get());
+    ASSERT_TRUE(import_result.ok()) << import_result.status().ToString();
+    auto actual = import_result.ValueOrDie();
+    ASSERT_TRUE(actual->Equals(*output_schema)) << actual->ToString() << "\nExpected:\n"
+                                                << output_schema->ToString();
+  };
+  // Check the declaration before importing arrays: a list/large_list mismatch can
+  // otherwise interpret 64-bit offsets as 32-bit offsets without an import error.
+  // Each callback result is released independently of the stream's cached schema.
+  ASSERT_NO_FATAL_FAILURE(verify_schema());
+  ASSERT_NO_FATAL_FAILURE(verify_schema());
+
+  for (const auto& json : expected_json) {
+    nanoarrow::UniqueArray array;
+    ASSERT_EQ(stream->get_next(stream.get(), array.get()), 0)
+        << stream->get_last_error(stream.get());
+    ASSERT_NE(array->release, nullptr);
+    ASSERT_NO_FATAL_FAILURE(verify_schema());
+    auto result = ::arrow::ImportRecordBatch(array.get(), output_schema);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    auto actual = result.ValueOrDie();
+    ASSERT_NE(actual, nullptr);
+    ASSERT_TRUE(actual->ValidateFull().ok()) << actual->ValidateFull().ToString();
+    ASSERT_TRUE(actual->schema()->Equals(*output_schema));
+    ICEBERG_UNWRAP_OR_FAIL(auto expected, MakeRecordBatch(expected_schema, json));
+    if (prune_columns) {
+      expected = expected->SelectColumns({2, 1}).ValueOrDie();
+    }
+    EXPECT_TRUE(actual->Equals(*expected)) << "Actual:\n"
+                                           << actual->ToString() << "\nExpected:\n"
+                                           << expected->ToString();
+  }
+  nanoarrow::UniqueArray end;
+  ASSERT_EQ(stream->get_next(stream.get(), end.get()), 0)
+      << stream->get_last_error(stream.get());
+  EXPECT_EQ(end->release, nullptr);
+  ASSERT_NO_FATAL_FAILURE(verify_schema());
+
+  // Returned schemas are owned by the caller and must outlive the stream's context.
+  stream.reset();
+  reader.reset();
+  auto retained_result = ::arrow::ImportSchema(retained_schema.get());
+  ASSERT_TRUE(retained_result.ok()) << retained_result.status().ToString();
+  EXPECT_TRUE(retained_result.ValueOrDie()->Equals(*output_schema));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DeleteBatches, FileScanTaskPhysicalSchemaTest,
+    ::testing::Combine(::testing::Values(DeleteBatchSelection::kFirstRow,
+                                         DeleteBatchSelection::kSecondBatchRow,
+                                         DeleteBatchSelection::kNoOp,
+                                         DeleteBatchSelection::kFirstBatch,
+                                         DeleteBatchSelection::kAll),
+                       ::testing::Bool(),
+                       ::testing::Values(PhysicalListLayout::kList,
+                                         PhysicalListLayout::kLargeList,
+                                         PhysicalListLayout::kStoredMixed)),
+    FileScanTaskPhysicalSchemaTest::ParamName);
 
 TEST_F(FileScanTaskReaderTest, OpenWithSchemasResolvesDroppedEqualityField) {
   auto current_schema = std::make_shared<Schema>(
