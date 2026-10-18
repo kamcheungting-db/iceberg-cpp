@@ -24,9 +24,18 @@ Status: proposed for discussion.
 ## Motivation and scope
 
 Add view format v1 metadata and REST catalog support so C++ engines can inspect
-and manage persisted Iceberg SQL views. Engines supply schemas and SQL and handle
-query resolution and execution. SQL parsing, materialized views, and additional
-catalog backends are outside the first release.
+and manage persisted Iceberg SQL views. For example, an engine can save an
+`analytics.active_customers` view, and another compatible engine can load its
+schema and SQL. Engines supply and validate schemas and SQL, resolve referenced
+tables, and execute queries. The library stores definitions and manages their
+lifecycle. SQL parsing, materialized views, and additional catalog backends are
+outside the first release.
+
+A **view version** records a definition: schema, SQL representations, resolution
+context, and summary. Each SQL representation pairs a query with its engine
+dialect, such as `spark`. A **metadata snapshot** is an owned, immutable copy of
+the view's metadata, including retained versions, the current version, history,
+and properties. It remains valid after later changes to the view.
 
 ## Proposed API
 
@@ -36,22 +45,66 @@ metadata, versions, updates, and requirements separate from their table types.
 | Surface | Operations |
 | --- | --- |
 | `Catalog` | `CreateView`, `LoadView`, `ListViews`, `ViewExists`, `ReplaceView`, `RenameView`, `DropView` |
-| `View` | Owned metadata snapshots, current schema/version, history, properties, `SqlFor(dialect)`, `Refresh` |
+| `View` | `snapshot()`, current schema/version, history, properties, `SqlFor(dialect)`, `Refresh` |
 | `View` mutations | `ReplaceVersion`, `UpdateProperties`, `UpdateLocation`; return a new `View` |
 
-`ViewDefinition` contains schema, SQL representations, resolution context, and
-summary. Creation also accepts properties and location. `Catalog::ReplaceView`
-submits ordered updates with an explicit UUID assertion; convenience methods
-build them from a loaded view.
+`ViewDefinition` contains the definition fields above. `ViewCreation` wraps it
+with optional location and properties. Create/load return a `View`;
+rename/drop return `Status`. `Catalog::ReplaceView` is the low-level commit API:
+it submits ordered updates with an explicit UUID assertion. The `View` mutation
+helpers build these updates for callers.
 
 Add optional `Catalog` methods defaulting to `NotSupported`, preserving source
 compatibility and fitting `SessionCatalog`. New virtual methods change the ABI;
 dependent binaries must rebuild. A separate Java-style `ViewCatalog` would need
 additional capability discovery and session factories.
 
-Snapshots own immutable metadata. Refresh checks the UUID and installs metadata,
-revision, and session state together; failure preserves the old state. Callers
-synchronize refresh. Retained snapshots remain usable independently.
+## Example: create, read, and replace
+
+This illustrates the proposed API; view support is not implemented yet. Includes
+are omitted, names are in namespace `iceberg`, and `catalog` is already configured.
+The macros propagate `Result`/`Status` errors.
+
+```cpp
+Status ManageActiveCustomers(Catalog& catalog) {
+  const TableIdentifier id{Namespace{{"analytics"}}, "active_customers"};
+  ViewCreation creation;
+  creation.definition.schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{
+          SchemaField::MakeOptional(1, "customer_id", int64())});
+  creation.definition.representations = {
+      {.sql = "SELECT customer_id FROM customers WHERE active = true",
+       .dialect = "spark"}};
+  creation.definition.default_catalog = "prod";
+  creation.definition.default_namespace = Namespace{{"crm"}};
+
+  ICEBERG_RETURN_UNEXPECTED(catalog.CreateView(id, creation));
+  ICEBERG_ASSIGN_OR_RAISE(auto view, catalog.LoadView(id));
+  ICEBERG_ASSIGN_OR_RAISE(auto sql, view->SqlFor("SPARK"));
+  // The engine can now plan and execute sql.sql using the saved context.
+
+  const auto before = view->snapshot();
+  auto next = creation.definition;
+  next.representations[0].sql =
+      "SELECT customer_id FROM customers WHERE active = true AND country = 'US'";
+  ICEBERG_ASSIGN_OR_RAISE(auto updated, view->ReplaceVersion(next));
+  // updated contains the new definition; view and before retain the old one.
+
+  ICEBERG_RETURN_UNEXPECTED(view->Refresh());
+  // view now has the latest metadata; before remains usable and unchanged.
+  return {};
+}
+```
+
+The engine resolves the unqualified `customers` reference as `prod.crm.customers`,
+using the stored defaults. The view itself lives in `analytics`. Both queries
+return the same `customer_id` schema, so replacement can reuse it. `SqlFor("SPARK")`
+selects the saved Spark SQL; `SqlFor("trino")` returns `NotFound`.
+
+`Refresh()` checks that the UUID still identifies the original view and installs
+metadata, revision, and session state together. A failed refresh preserves the
+old state. Callers synchronize refresh with other operations on the same handle.
+Mutation helpers return a new handle and leave the original unchanged.
 
 ## Metadata behavior
 
@@ -62,41 +115,58 @@ synchronize refresh. Retained snapshots remain usable independently.
   dialect. Preserve opaque unknown representations for round trips and property
   edits; reject definition changes involving them.
 - Reuse schemas only when persisted content, including nested comments, matches.
-  C++ `Schema::SameSchema` alone omits comments. Comment-only replacement must
-  preserve the requested comments and leave old versions unchanged.
+  For example, changing only the `customer_id` comment preserves that change in
+  the replacement while older versions keep their original comments.
+  C++ `Schema::SameSchema` alone omits comments and cannot implement this rule.
 - Reuse equivalent retained versions; resolve REST `-1` placeholders in update
-  order and use authoritative server-assigned IDs.
-- Stage one history entry per builder: `v1 -> v2 -> v3` records only `v3`.
-  Reactivations use fresh timestamps; property/location-only changes add no history.
-  `Build()` finalizes once; publication requires a commit.
+  order (`-1` means the last schema/version added in that request). Use the IDs
+  returned by the server.
+- Stage one history entry per builder. Selecting `v1 -> v2 -> v3` locally appends
+  only `v3` to history; intermediate `v2` is recorded only if committed separately.
+  Returning from `v1 -> v2 -> v1` locally records a fresh activation of `v1`.
+  Property/location-only changes add no history. `Build()` finalizes once;
+  publication requires a commit.
 - Default `version.history.num-entries` to 10; require a positive value and
   protect current/new versions. Prevent dialect removal unless
   `replace.drop-dialect.allowed=true`.
 
 ## Commits and concurrency
 
-Ordinary replacement refreshes its base, validates the definition, and submits
-standard REST updates. The server commits atomically and returns authoritative
-metadata. UUID assertions detect drop/recreation; two writers with the same UUID
-can both succeed. Refresh does not close this race. Rename/drop have no UUID guard.
+Ordinary `ReplaceVersion` loads a fresh base without changing the original handle,
+validates the definition, and submits standard REST updates. The server commits
+atomically and returns authoritative metadata. UUID assertions detect
+drop/recreation; two writers with the same UUID can both succeed. If both succeed,
+the later commit determines the current version. Refresh does not close this race.
+Rename/drop have no UUID guard.
 
 ![Ordinary UUID checks allow competing replacements; a supported conditional backend rejects a stale revision.](diagrams/view-replacement-concurrency.svg)
 
-Offer optional `ReplaceVersionIfUnchanged(definition, expected_revision)`, backed
-by `Catalog::ReplaceViewIfUnchanged`. Callers capture metadata and an opaque
-`ViewRevision` together through `snapshot()`. The revision binds UUID, catalog,
-identifier, and protocol. The backend atomically checks the fixed expectation
-with publication; every publication advances it. Conditional no-ops still require
-a remote assertion.
+Callers requiring an unchanged-since-read guarantee use optional
+`ReplaceVersionIfUnchanged(definition, expected_revision)`, backed by
+`Catalog::ReplaceViewIfUnchanged`. Capture metadata and its optional `ViewRevision`
+together through `snapshot()`, then derive the change from that captured metadata.
+The **revision** is an opaque backend token bound to the UUID, catalog, identifier,
+and protocol. Every metadata publication advances it: changing a property keeps
+the current SQL version but invalidates an earlier revision.
+
+The backend atomically checks the fixed revision when publishing. In the diagram,
+A commits at `R1` and advances it to `R2`; B's conditional write using `R1` fails
+without publishing changes. Conditional no-ops still require a remote assertion.
 
 Standard REST has no revision assertion. Return `NotSupported` until a documented
 server profile provides atomic enforcement and token/error semantics. Never fall
 back to an ordinary write or change the expectation. This is an optional extension.
 
-Make at most one mutation attempt per call. Replacement conflicts return
-`CommitFailed`; lost responses, mutation 5xx, or unusable commit responses return
-`CommitStateUnknown`. Callers inspect state before deciding what to do next;
-uncertain outcomes trigger no automatic replay or cleanup.
+Make at most one mutation attempt per call:
+
+| Situation | Result and caller action |
+| --- | --- |
+| Conditional revision is stale | `CommitFailed`; reload and reconsider the change before submitting another request. |
+| Backend has only standard REST support | Conditional replacement returns `NotSupported`; the caller must explicitly choose whether an ordinary write is acceptable. |
+| Commit response is lost, is HTTP 5xx, or cannot be used | `CommitStateUnknown`; the write may have succeeded. Inspect state before deciding what to do next. |
+
+Other confirmed replacement conflicts also return `CommitFailed`. The library
+never automatically replays a mutation or cleans up after an uncertain outcome.
 
 ## REST integration
 
@@ -107,8 +177,11 @@ Reuse contextual authentication and `AuthManager::TableSession` for view session
 Distinguish absent response config from an empty map when refreshing overrides.
 
 `RenameView` succeeds on HTTP 204 without an implicit load. A separate
-`LoadView(to)` failure cannot change the completed rename result. Old handles
-retain their identifier and snapshot. Confirmed missing-view drops succeed.
+`LoadView(to)` failure cannot change the completed rename result. For example,
+renaming `analytics.active_customers` to `analytics.current_customers` succeeds
+even if a subsequent load is denied by the destination's read permissions.
+Old handles retain their identifier and snapshot. Confirmed missing-view drops
+succeed.
 
 ## Delivery and validation
 
