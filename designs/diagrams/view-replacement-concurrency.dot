@@ -1,0 +1,47 @@
+/*
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+*/
+digraph behavior {
+
+  graph [bgcolor="white", pad="0.3", nodesep="0.35", ranksep="0.45", fontname="DejaVu Sans", fontsize=14];
+  node [shape=box, style="rounded,filled", color="#94a3b8", fillcolor="#f8fafc", fontname="DejaVu Sans", fontsize=12, fontcolor="#0f172a", margin="0.18,0.12"];
+  edge [color="#64748b", fontname="DejaVu Sans", fontsize=11, fontcolor="#334155", arrowsize=0.75];
+
+  rankdir=TB;
+  subgraph ordinary {
+    otitle [label="Ordinary REST replacement", fillcolor="#dbeafe", color="#60a5fa", fontsize=14, group=ordinary];
+    obase [label="A and B plan from the same view UUID U", fillcolor="#eff6ff", color="#60a5fa", group=ordinary];
+    oa [label="A sends updates + assert-view-uuid(U)\nA commits successfully", group=ordinary];
+    ob [label="B sends updates + assert-view-uuid(U)\nUUID still matches; B can also commit", group=ordinary];
+    oresult [label="If both succeed, B's later update\ndetermines the current version", fillcolor="#fef3c7", color="#d97706", group=ordinary];
+    otitle -> obase -> oa -> ob -> oresult;
+  }
+  subgraph conditional {
+    ctitle [label="Conditional replacement\nSupporting backend required", fillcolor="#d1fae5", color="#34d399", fontsize=14, group=conditional];
+    cbase [label="A and B capture the same UUID U / revision R1", fillcolor="#eff6ff", color="#60a5fa", group=conditional];
+    ca [label="A atomically checks U / R1 and commits\nBackend advances revision to R2", group=conditional];
+    cb [label="B sends its fixed expectation U / R1\nAtomic check finds R2 instead", group=conditional];
+    cresult [label="B receives CommitFailed\nB publishes no changes; no automatic retry", fillcolor="#fff7ed", color="#fb923c", group=conditional];
+    ctitle -> cbase -> ca -> cb -> cresult;
+  }
+  { rank=same; otitle; ctitle; }
+  { rank=same; obase; cbase; }
+  { rank=same; oa; ca; }
+  { rank=same; ob; cb; }
+  { rank=same; oresult; cresult; }
+}
