@@ -52,13 +52,13 @@ metadata, versions, updates, and requirements separate from their table types.
 
 | Surface | Operations |
 | --- | --- |
-| `Catalog` | `CreateView`, `RegisterView`, `LoadView`, `ListViews`, `ViewExists`, `ReplaceView`, `RenameView`, `DropView` |
+| `ViewCatalog` | `CreateView`, `RegisterView`, `LoadView`, `ListViews`, `ViewExists`, `ReplaceView`, `RenameView`, `DropView` |
 | `View` | `snapshot()`, `uuid()`, `location()`, current version and schema ids, `VersionById`, `SchemaById`, `History()`, properties, `SqlFor(dialect)`, `Refresh` |
 | `View` mutations | `ReplaceVersion`, `UpdateProperties`, `UpdateLocation`; return a new `View` |
 
 `ViewDefinition` contains the definition fields above. `ViewCreation` wraps it
 with optional location and properties. Create/load/register return a `View`;
-rename/drop return `Status`. `Catalog::ReplaceView(identifier, requirements,
+rename/drop return `Status`. `ViewCatalog::ReplaceView(identifier, requirements,
 updates)` mirrors `UpdateTable` as the low-level commit API: requirements carry
 the UUID assertion and updates are ordered view updates; it returns the server's
 authoritative `View`. The `View` mutation helpers build these updates for
@@ -78,10 +78,14 @@ Details fixed before implementation:
   `engine-name` and `engine-version`, unchanged; it never invents engine
   identity.
 
-Add optional `Catalog` methods defaulting to `NotSupported`, preserving source
-compatibility and fitting `SessionCatalog`. New virtual methods change the ABI;
-dependent binaries must rebuild. A separate Java-style `ViewCatalog` would need
-additional capability discovery and session factories.
+`ViewCatalog` is a separate pure interface; `Catalog` and `SessionCatalog` keep
+their shape and ABI, and catalogs without view support simply do not implement
+it. Catalogs with view support make one session-bound object implement both
+interfaces, the way REST context catalogs are built today, so contextual
+authentication and configuration apply to view sessions unchanged. Discovery is
+a cast: `AsViewCatalog(catalog)` returns the same session-bound object as a
+`ViewCatalog`, or `NotSupported`. There are no per-operation probes and no new
+vtables on existing interfaces.
 
 ## Example: create, read, and replace
 
@@ -91,6 +95,7 @@ The macros propagate `Result`/`Status` errors.
 
 ```cpp
 Status ManageActiveCustomers(Catalog& catalog) {
+  ICEBERG_ASSIGN_OR_RAISE(auto views, AsViewCatalog(catalog));
   const TableIdentifier id{Namespace{{"analytics"}}, "active_customers"};
   ViewCreation creation;
   creation.definition.schema = std::make_shared<Schema>(
@@ -102,8 +107,8 @@ Status ManageActiveCustomers(Catalog& catalog) {
   creation.definition.default_catalog = "prod";
   creation.definition.default_namespace = Namespace{{"crm"}};
 
-  ICEBERG_RETURN_UNEXPECTED(catalog.CreateView(id, creation));
-  ICEBERG_ASSIGN_OR_RAISE(auto view, catalog.LoadView(id));
+  ICEBERG_RETURN_UNEXPECTED(views->CreateView(id, creation));
+  ICEBERG_ASSIGN_OR_RAISE(auto view, views->LoadView(id));
   ICEBERG_ASSIGN_OR_RAISE(auto sql, view->SqlFor("SPARK"));
   // The engine can now plan and execute sql.sql using the saved context.
 
@@ -131,9 +136,9 @@ metadata, session state, and the optional revision token together. A failed
 refresh preserves the old state: a missing view returns `kNoSuchView`, and a
 UUID mismatch — the view was dropped and recreated under the same name — also
 returns `kNoSuchView`, with a message naming the expected UUID, so engines treat
-"the view I hold is gone" uniformly. Callers synchronize refresh with other
-operations on the same handle. Mutation helpers return a new handle and leave
-the original unchanged.
+"the view I hold is gone" uniformly and recover the same way: reload and
+re-decide. Callers synchronize refresh with other operations on the same
+handle. Mutation helpers return a new handle and leave the original unchanged.
 
 ## Metadata behavior
 
@@ -195,7 +200,7 @@ never automatically replays a mutation or cleans up after an uncertain outcome.
 The diagram's second half describes a deferred extension. Callers requiring an
 unchanged-since-read guarantee would use optional
 `ReplaceVersionIfUnchanged(definition, expected_revision)`, backed by
-`Catalog::ReplaceViewIfUnchanged`. Capture metadata and its optional `ViewRevision`
+`ViewCatalog::ReplaceViewIfUnchanged`. Capture metadata and its optional `ViewRevision`
 together through `snapshot()`, then derive the change from that captured metadata.
 The **revision** is an opaque backend token bound to the UUID, catalog, identifier,
 and protocol. Every metadata publication advances it: changing a property keeps
@@ -210,6 +215,14 @@ ordinary write or changing the expectation. A stale conditional revision returns
 `CommitFailed`; reload and reconsider the change before submitting another
 request. A backend with only standard REST support also returns `NotSupported`,
 leaving the caller to decide explicitly whether an ordinary write is acceptable.
+
+Deferring costs little: the immutable snapshot already carries everything a
+conditional check needs, so the extension can be added later without breaking
+the API. The client-side addition is small — one requirement type, one catalog
+method, one `View` helper. The blocker is the backend: standard REST has no
+revision assertion, so shipping earlier would mean inventing a server contract
+with no implementation to test against, risking divergence from whatever the
+REST specification later adopts.
 
 ## REST integration
 
@@ -234,7 +247,7 @@ identifier returns `kNoSuchView`. Confirmed missing-view drops succeed.
 | --- | --- | --- |
 | 1 | Metadata, JSON, builder, ordered updates | Pinned Java/Rust fixtures; malformed metadata, comment-only changes, candidate IDs and version-reuse equivalence, history, retention, dialects, injected clock |
 | 2 | View inspection and REST read operations | Snapshot lifetime, UUID refresh checks and failure kinds, endpoint support, pagination, contextual/view sessions |
-| 3 | Catalog mutations, register, in-memory catalog support | Reference-service lifecycle tests, conflicts, uncertain outcomes, rename/load separation, register-by-location, commit-failure parity with tables |
+| 3 | ViewCatalog mutations, register, in-memory catalog support | Reference-service lifecycle tests, conflicts, uncertain outcomes, rename/load separation, register-by-location, commit-failure parity with tables |
 
 Run affected tests and pre-commit. Pin a view-capable REST service before PR 2;
 initial candidates are the Java REST reference catalog, Apache Polaris, and
@@ -244,9 +257,9 @@ competing requests against a real service.
 
 ## Feedback requested
 
-1. Are optional `Catalog` methods — now including `RegisterView` — and the
-   immutable snapshot API suitable, or should view operations live behind a
-   separate interface to avoid widening `Catalog`'s ABI?
+1. Is the separate `ViewCatalog` interface — discovered by casting a
+   session-bound `Catalog`, keeping `Catalog`'s ABI stable — the right split,
+   or should view operations fold into `Catalog` with `NotSupported` defaults?
 2. Are explicit dialect lookup, opaque representation preservation, single
    mutation attempts, and UUID mismatches reported as `kNoSuchView` the right
    initial policies?
