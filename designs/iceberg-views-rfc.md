@@ -28,8 +28,16 @@ and manage persisted Iceberg SQL views. For example, an engine can save an
 `analytics.active_customers` view, and another compatible engine can load its
 schema and SQL. Engines supply and validate schemas and SQL, resolve referenced
 tables, and execute queries. The library stores definitions and manages their
-lifecycle. SQL parsing, materialized views, and additional catalog backends are
-outside the first release.
+lifecycle.
+
+Non-goals for the first release:
+
+- SQL parsing or planning; engines validate and execute the SQL they read.
+- Materialized views.
+- View storage in non-REST backends. The in-memory catalog implements the same
+  operations, but only as test infrastructure.
+- Metadata file management: with REST the catalog server writes view metadata
+  files, so the client submits updates and reads inline metadata only.
 
 A **view version** records a definition: schema, SQL representations, resolution
 context, and summary. Each SQL representation pairs a query with its engine
@@ -44,15 +52,31 @@ metadata, versions, updates, and requirements separate from their table types.
 
 | Surface | Operations |
 | --- | --- |
-| `Catalog` | `CreateView`, `LoadView`, `ListViews`, `ViewExists`, `ReplaceView`, `RenameView`, `DropView` |
-| `View` | `snapshot()`, current schema/version, history, properties, `SqlFor(dialect)`, `Refresh` |
+| `Catalog` | `CreateView`, `RegisterView`, `LoadView`, `ListViews`, `ViewExists`, `ReplaceView`, `RenameView`, `DropView` |
+| `View` | `snapshot()`, `uuid()`, `location()`, current version and schema ids, `VersionById`, `SchemaById`, `History()`, properties, `SqlFor(dialect)`, `Refresh` |
 | `View` mutations | `ReplaceVersion`, `UpdateProperties`, `UpdateLocation`; return a new `View` |
 
 `ViewDefinition` contains the definition fields above. `ViewCreation` wraps it
-with optional location and properties. Create/load return a `View`;
-rename/drop return `Status`. `Catalog::ReplaceView` is the low-level commit API:
-it submits ordered updates with an explicit UUID assertion. The `View` mutation
-helpers build these updates for callers.
+with optional location and properties. Create/load/register return a `View`;
+rename/drop return `Status`. `Catalog::ReplaceView(identifier, requirements,
+updates)` mirrors `UpdateTable` as the low-level commit API: requirements carry
+the UUID assertion and updates are ordered view updates; it returns the server's
+authoritative `View`. The `View` mutation helpers build these updates for
+callers.
+
+Details fixed before implementation:
+
+- `SqlFor(dialect)` returns the matched representation — query text and dialect —
+  not a bare string, so callers log or persist exactly what matched.
+- `UpdateProperties(updates, removals)` takes the same arguments as
+  `Catalog::UpdateNamespaceProperties`.
+- `RegisterView(identifier, metadata_file_location)` mirrors `RegisterTable`
+  and the REST `registerView` endpoint.
+- Views and tables share one name space: create and register return
+  `kAlreadyExists` when the identifier is taken by either.
+- The library records the caller-supplied version summary, including
+  `engine-name` and `engine-version`, unchanged; it never invents engine
+  identity.
 
 Add optional `Catalog` methods defaulting to `NotSupported`, preserving source
 compatibility and fitting `SessionCatalog`. New virtual methods change the ABI;
@@ -99,33 +123,49 @@ Status ManageActiveCustomers(Catalog& catalog) {
 The engine resolves the unqualified `customers` reference as `prod.crm.customers`,
 using the stored defaults. The view itself lives in `analytics`. Both queries
 return the same `customer_id` schema, so replacement can reuse it. `SqlFor("SPARK")`
-selects the saved Spark SQL; `SqlFor("trino")` returns `NotFound`.
+returns the saved Spark representation — query text and dialect `spark` — while
+`SqlFor("trino")` returns `NotFound`.
 
 `Refresh()` checks that the UUID still identifies the original view and installs
-metadata, revision, and session state together. A failed refresh preserves the
-old state. Callers synchronize refresh with other operations on the same handle.
-Mutation helpers return a new handle and leave the original unchanged.
+metadata, session state, and the optional revision token together. A failed
+refresh preserves the old state: a missing view returns `kNoSuchView`, and a
+UUID mismatch — the view was dropped and recreated under the same name — also
+returns `kNoSuchView`, with a message naming the expected UUID, so engines treat
+"the view I hold is gone" uniformly. Callers synchronize refresh with other
+operations on the same handle. Mutation helpers return a new handle and leave
+the original unchanged.
 
 ## Metadata behavior
 
 - Validate view-v1 IDs, references, required fields, and duplicate dialects without
   applying table-v1 schema restrictions. Parsing does not modify metadata.
+  Invariants: `format-version` must be 1, `current-version-id` must reference a
+  listed version, each version's `schema-id` must reference a listed schema, and
+  `location` and each version's `default-namespace` must be non-empty.
 - Match SQL dialects with ASCII case folding; return `NotFound` when the requested
   dialect is absent. Unlike Java's fallback lookup, never substitute another
-  dialect. Preserve opaque unknown representations for round trips and property
+  dialect. Store dialect strings as written and detect duplicates with the same
+  folding. Preserve opaque unknown representations for round trips and property
   edits; reject definition changes involving them.
 - Reuse schemas only when persisted content, including nested comments, matches.
   For example, changing only the `customer_id` comment preserves that change in
   the replacement while older versions keep their original comments.
   C++ `Schema::SameSchema` alone omits comments and cannot implement this rule.
-- Reuse equivalent retained versions; resolve REST `-1` placeholders in update
-  order (`-1` means the last schema/version added in that request). Use the IDs
-  returned by the server.
+- Reuse a retained version when its summary, ordered representations, default
+  catalog, default namespace, and resolved schema id all match, ignoring
+  `timestamp-ms` and `version-id` — the equivalence Java applies. Otherwise
+  assign `max(version-id) + 1`, starting at 0 for a new view.
+- Resolve REST `-1` placeholders in update order (`-1` means the last
+  schema/version added in that request). Builders assign candidate IDs and emit
+  `-1` for same-request references, and adopt the IDs returned by the server as
+  authoritative.
 - Stage one history entry per builder. Selecting `v1 -> v2 -> v3` locally appends
   only `v3` to history; intermediate `v2` is recorded only if committed separately.
   Returning from `v1 -> v2 -> v1` locally records a fresh activation of `v1`.
   Property/location-only changes add no history. `Build()` finalizes once;
-  publication requires a commit.
+  publication requires a commit. Take version and history timestamps from the
+  time utility shared with table metadata (`CurrentTimePointMs`), and let tests
+  inject the clock.
 - Default `version.history.num-entries` to 10; require a positive value and
   protect current/new versions. Prevent dialect removal unless
   `replace.drop-dialect.allowed=true`.
@@ -137,71 +177,82 @@ validates the definition, and submits standard REST updates. The server commits
 atomically and returns authoritative metadata. UUID assertions detect
 drop/recreation; two writers with the same UUID can both succeed. If both succeed,
 the later commit determines the current version. Refresh does not close this race.
-Rename/drop have no UUID guard.
+Rename/drop have no UUID guard. The first release ships this ordinary path only.
 
 ![Ordinary UUID checks allow competing replacements; a supported conditional backend rejects a stale revision.](diagrams/view-replacement-concurrency.svg)
 
-Callers requiring an unchanged-since-read guarantee use optional
+Make at most one mutation attempt per call. A lost commit response, HTTP 5xx, or
+an unusable commit response returns `CommitStateUnknown`; the write may have
+succeeded, so inspect state before deciding what to do next. This classification
+must match the existing table commit path (`UpdateTable`) so tables and views
+report identical outcomes for identical failures; the REST groundwork already
+maps view commits (`409` to `CommitFailed`, `5xx` to `CommitStateUnknown`).
+Other confirmed replacement conflicts also return `CommitFailed`. The library
+never automatically replays a mutation or cleans up after an uncertain outcome.
+
+### Extension: conditional replacement (deferred)
+
+The diagram's second half describes a deferred extension. Callers requiring an
+unchanged-since-read guarantee would use optional
 `ReplaceVersionIfUnchanged(definition, expected_revision)`, backed by
 `Catalog::ReplaceViewIfUnchanged`. Capture metadata and its optional `ViewRevision`
 together through `snapshot()`, then derive the change from that captured metadata.
 The **revision** is an opaque backend token bound to the UUID, catalog, identifier,
 and protocol. Every metadata publication advances it: changing a property keeps
-the current SQL version but invalidates an earlier revision.
+the current SQL version but invalidates an earlier revision. The backend
+atomically checks the fixed revision when publishing; conditional no-ops still
+require a remote assertion.
 
-The backend atomically checks the fixed revision when publishing. In the diagram,
-A commits at `R1` and advances it to `R2`; B's conditional write using `R1` fails
-without publishing changes. Conditional no-ops still require a remote assertion.
-
-Standard REST has no revision assertion. Return `NotSupported` until a documented
-server profile provides atomic enforcement and token/error semantics. Never fall
-back to an ordinary write or change the expectation. This is an optional extension.
-
-Make at most one mutation attempt per call:
-
-| Situation | Result and caller action |
-| --- | --- |
-| Conditional revision is stale | `CommitFailed`; reload and reconsider the change before submitting another request. |
-| Backend has only standard REST support | Conditional replacement returns `NotSupported`; the caller must explicitly choose whether an ordinary write is acceptable. |
-| Commit response is lost, is HTTP 5xx, or cannot be used | `CommitStateUnknown`; the write may have succeeded. Inspect state before deciding what to do next. |
-
-Other confirmed replacement conflicts also return `CommitFailed`. The library
-never automatically replays a mutation or cleans up after an uncertain outcome.
+Standard REST has no revision assertion, so this extension stays out of the
+initial delivery: until a documented server profile provides atomic enforcement
+and token/error semantics, it returns `NotSupported`, never falling back to an
+ordinary write or changing the expectation. A stale conditional revision returns
+`CommitFailed`; reload and reconsider the change before submitting another
+request. A backend with only standard REST support also returns `NotSupported`,
+leaving the caller to decide explicitly whether an ordinary write is acceptable.
 
 ## REST integration
 
 Honor advertised endpoints; unsupported operations return `NotSupported`. Follow
-list pagination and fall back from unadvertised HEAD to advertised Load for
-existence checks. Load inline metadata without requiring FileIO or storage access.
-Reuse contextual authentication and `AuthManager::TableSession` for view sessions.
-Distinguish absent response config from an empty map when refreshing overrides.
+list pagination, the same mechanism as `ListTables`, and fall back from
+unadvertised HEAD to advertised Load for existence checks. Load inline metadata
+without requiring FileIO or storage access; `RegisterView` passes the stored
+metadata location to the server, which reads it. Reuse contextual authentication
+and `AuthManager::TableSession` for view sessions. Distinguish absent response
+config from an empty map when refreshing overrides.
 
 `RenameView` succeeds on HTTP 204 without an implicit load. A separate
 `LoadView(to)` failure cannot change the completed rename result. For example,
 renaming `analytics.active_customers` to `analytics.current_customers` succeeds
 even if a subsequent load is denied by the destination's read permissions.
-Old handles retain their identifier and snapshot. Confirmed missing-view drops
-succeed.
+Old handles retain their identifier and snapshot; refreshing through the old
+identifier returns `kNoSuchView`. Confirmed missing-view drops succeed.
 
 ## Delivery and validation
 
 | PR | Scope | Required evidence |
 | --- | --- | --- |
-| 1 | Metadata, JSON, builder, ordered updates | Pinned Java/Rust fixtures; malformed metadata, comment-only changes, IDs, history, retention, dialects |
-| 2 | View inspection and REST read operations | Snapshot lifetime, UUID refresh checks, endpoint support, pagination, contextual/view sessions |
-| 3 | Catalog mutations and optional conditional API | Reference-service lifecycle tests, conflicts, uncertain outcomes, rename/load separation, unsupported conditional behavior |
+| 1 | Metadata, JSON, builder, ordered updates | Pinned Java/Rust fixtures; malformed metadata, comment-only changes, candidate IDs and version-reuse equivalence, history, retention, dialects, injected clock |
+| 2 | View inspection and REST read operations | Snapshot lifetime, UUID refresh checks and failure kinds, endpoint support, pagination, contextual/view sessions |
+| 3 | Catalog mutations, register, in-memory catalog support | Reference-service lifecycle tests, conflicts, uncertain outcomes, rename/load separation, register-by-location, commit-failure parity with tables |
 
-Run affected tests and pre-commit. Pin a view-capable REST service before PR 2.
-Enable conditional writes only after testing atomicity with competing requests
-against a real service. Ordinary REST support can ship independently.
+Run affected tests and pre-commit. Pin a view-capable REST service before PR 2;
+initial candidates are the Java REST reference catalog, Apache Polaris, and
+Lakekeeper. Ordinary REST support ships independently of the deferred
+conditional extension, which is enabled only after testing atomicity with
+competing requests against a real service.
 
 ## Feedback requested
 
-1. Are optional `Catalog` methods and the proposed immutable snapshot API suitable?
-2. Are explicit dialect lookup, opaque representation preservation, and single
-   mutation attempts the right initial policies?
-3. Which REST service should provide interoperability tests, and which documented
-   profile could support conditional replacement?
+1. Are optional `Catalog` methods — now including `RegisterView` — and the
+   immutable snapshot API suitable, or should view operations live behind a
+   separate interface to avoid widening `Catalog`'s ABI?
+2. Are explicit dialect lookup, opaque representation preservation, single
+   mutation attempts, and UUID mismatches reported as `kNoSuchView` the right
+   initial policies?
+3. Which REST service should provide interoperability tests — the Java reference
+   catalog, Apache Polaris, or Lakekeeper — and is deferring the conditional
+   replacement API acceptable?
 
 ## References
 
